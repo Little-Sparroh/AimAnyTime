@@ -1,12 +1,13 @@
-# Reload Any Time
+# Aim Any Time
 
-A BepInEx mod for Mycopunk that improves aiming constraints so you can aim while reloading, sliding, and sprinting.
+A BepInEx mod for Mycopunk that lets you aim while reloading, sliding, and sprinting — without losing reload animation feedback.
 
 ## Features
 
-- **Aim While Reloading**: Keep aiming during reloads.
-- **Aim While Sliding**: Allow aiming during slides.
-- **Aim While Sprinting**: Allow aiming during sprint and resume sprint after aiming when appropriate.
+- **Aim While Reloading**: Stay in ADS (FOV/aim state) during reloads.
+- **Show Reload Anim While Aiming**: Temporarily hide the aim pose during reload so the reload animation is visible and you can tell when you're ready to fire again.
+- **Aim While Sliding**: Allow aiming during slides (uses the same player override as the vanilla Aim While Sliding upgrade).
+- **Aim While Sprinting**: Allow aiming during sprint without cancelling sprint.
 
 ## Getting Started
 
@@ -35,7 +36,7 @@ dotnet build --configuration Release
 2. The mod will be automatically installed to the correct directory
 
 **Manual Installation**:
-1. Place the built `ReloadAnyTime.dll` in your `<Mycopunk Directory>/BepInEx/plugins/` folder
+1. Place the built `AimAnyTime.dll` in your `<Mycopunk Directory>/BepInEx/plugins/` folder
 
 ### Executing program
 
@@ -43,21 +44,26 @@ The mod loads automatically through BepInEx when the game starts. Check the BepI
 
 ## Configuration
 
-Access mod settings through the BepInEx configuration file at `<Mycopunk Directory>/BepInEx/config/sparroh.reloadanytime.cfg`:
+Access mod settings through the BepInEx configuration file at `<Mycopunk Directory>/BepInEx/config/sparroh.aimanytime.cfg`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Can Aim While Sliding | `true` | Allows aiming weapons while sliding. |
-| Can Aim While Reloading | `true` | Allows aiming weapons while reloading. |
-| Can Aim While Sprinting | `true` | Allows aiming weapons while sprinting. |
+| Can Aim While Reloading | `true` | Keeps ADS active while reloading (FOV/aim state). |
+| Can Aim While Sprinting | `true` | Allows aiming weapons while sprinting without cancelling sprint. |
+| Show Reload Anim While Aiming | `true` | While ADS-reloading, hide the aim pose so the reload animation is visible. |
 
-Config changes are hot-reloaded while the game is running. Editing the `.cfg` file (or changing settings in-game) re-applies aim constraints to equipped weapons without a restart. Disabling a setting restores the weapon's original constraint values.
+Config changes are hot-reloaded while the game is running.
+
+## How it works (short)
+
+Vanilla ADS uses a full (non-additive) aim animation layer that covers the base layer. Enabling aim-while-reload alone keeps that layer up and hides the reload. This mod keeps ADS state on during reload, but drops the aim layer for the reload so the clip and its ammo events stay readable.
 
 ## Help
 
 * **Mod not loading?** Verify BepInEx is installed correctly and check console logs for errors
-* **Aiming still blocked?** Ensure the relevant config options are enabled; changes apply immediately after save
-
+* **Reload still invisible?** Ensure both `Can Aim While Reloading` and `Show Reload Anim While Aiming` are enabled
+* **Aiming still blocked while sprinting?** Ensure `Can Aim While Sprinting` is enabled; some weapons use a sprint lock that this setting clears
 
 ## Authors
 

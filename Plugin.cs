@@ -13,29 +13,24 @@ using UnityEngine;
 [MycoMod(null, ModFlags.IsSandbox)]
 public class SparrohPlugin : BaseUnityPlugin
 {
-    public const string PluginGUID = "sparroh.reloadanytime";
-    public const string PluginName = "ReloadAnyTime";
-    public const string PluginVersion = "1.0.1";
+    public const string PluginGUID = "sparroh.aimanytime";
+    public const string PluginName = "AimAnyTime";
+    public const string PluginVersion = "1.1.0";
+
 
     internal static new ManualLogSource Logger;
+
     internal static ConfigEntry<bool> enableCanAimWhileSliding;
     internal static ConfigEntry<bool> enableCanAimWhileReloading;
     internal static ConfigEntry<bool> enableCanAimWhileSprinting;
+    internal static ConfigEntry<bool> showReloadAnimWhileAiming;
 
     private static readonly FieldInfo lockSprintingField = AccessTools.Field(typeof(Gun), "lockSprinting");
-    private static readonly FieldInfo gunDataField = AccessTools.Field(typeof(Gun), "gunData");
-    private static readonly Dictionary<int, OriginalAimConstraints> originalConstraints = new Dictionary<int, OriginalAimConstraints>();
+    private static readonly Dictionary<int, bool> originalLockSprinting = new Dictionary<int, bool>();
 
     private Harmony harmony;
     private FileSystemWatcher configWatcher;
     private static volatile bool pendingConstraintRefresh;
-
-    private struct OriginalAimConstraints
-    {
-        public FireConstraints.ActionFireMode CanAimWhileSliding;
-        public bool CanAimWhileReloading;
-        public bool LockSprinting;
-    }
 
     private void Awake()
     {
@@ -51,17 +46,24 @@ public class SparrohPlugin : BaseUnityPlugin
             "General",
             "Can Aim While Reloading",
             true,
-            "Allows aiming weapons while reloading.");
+            "Keeps ADS active while reloading (FOV/aim state). Pair with Show Reload Anim While Aiming for visible reload feedback.");
 
         enableCanAimWhileSprinting = Config.Bind(
             "General",
             "Can Aim While Sprinting",
             true,
-            "Allows aiming weapons while sprinting.");
+            "Allows aiming weapons while sprinting without cancelling sprint.");
 
-        enableCanAimWhileSliding.SettingChanged += OnAimConstraintSettingChanged;
-        enableCanAimWhileReloading.SettingChanged += OnAimConstraintSettingChanged;
-        enableCanAimWhileSprinting.SettingChanged += OnAimConstraintSettingChanged;
+        showReloadAnimWhileAiming = Config.Bind(
+            "General",
+            "Show Reload Anim While Aiming",
+            true,
+            "While ADS-reloading, temporarily hide the aim pose so the reload animation is visible. ADS state (FOV) stays active.");
+
+        enableCanAimWhileSliding.SettingChanged += OnSettingChanged;
+        enableCanAimWhileReloading.SettingChanged += OnSettingChanged;
+        enableCanAimWhileSprinting.SettingChanged += OnSettingChanged;
+        showReloadAnimWhileAiming.SettingChanged += OnSettingChanged;
 
         try
         {
@@ -76,50 +78,14 @@ public class SparrohPlugin : BaseUnityPlugin
 
         try
         {
-            MethodInfo setupMethod = AccessTools.Method(typeof(Gun), "Setup", new Type[] { typeof(Player), typeof(PlayerAnimation), typeof(IGear) });
-            if (setupMethod == null)
-            {
-                Logger.LogError("Could not find Gun.Setup method for patching.");
-            }
-            else
-            {
-                HarmonyMethod setupPrefix = new HarmonyMethod(typeof(SparrohPlugin), nameof(ModifyWeaponPrefix));
-                harmony.Patch(setupMethod, prefix: setupPrefix);
-            }
+            harmony.PatchAll(typeof(CanAimPatches));
+            harmony.PatchAll(typeof(ReloadAimAnimPatches));
+            harmony.PatchAll(typeof(GunSetupPatches));
+            Logger.LogInfo("Harmony patches applied.");
         }
         catch (Exception ex)
         {
-            Logger.LogError($"Error patching Gun.Setup: {ex.Message}");
-        }
-
-        try
-        {
-            MethodInfo onStartAimMethod = AccessTools.Method(typeof(Gun), "OnStartAim");
-            if (onStartAimMethod == null)
-            {
-                Logger.LogError("Could not find Gun.OnStartAim method!");
-            }
-            else
-            {
-                HarmonyMethod onStartAimPrefix = new HarmonyMethod(typeof(SparrohPlugin), nameof(OnStartAimPrefix));
-                HarmonyMethod onStartAimPostfix = new HarmonyMethod(typeof(SparrohPlugin), nameof(OnStartAimPostfix));
-                harmony.Patch(onStartAimMethod, prefix: onStartAimPrefix, postfix: onStartAimPostfix);
-            }
-
-            MethodInfo canAimMethod = AccessTools.Method(typeof(Gun), "CanAim");
-            if (canAimMethod == null)
-            {
-                Logger.LogError("Could not find Gun.CanAim method!");
-            }
-            else
-            {
-                HarmonyMethod canAimPrefix = new HarmonyMethod(typeof(SparrohPlugin), nameof(CanAimPrefix));
-                harmony.Patch(canAimMethod, prefix: canAimPrefix);
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError($"Error setting up aiming patches: {ex.Message}");
+            Logger.LogError($"Error applying patches: {ex.Message}");
         }
 
         Logger.LogInfo($"{PluginName} v{PluginVersion} loaded successfully.");
@@ -131,7 +97,8 @@ public class SparrohPlugin : BaseUnityPlugin
             return;
 
         pendingConstraintRefresh = false;
-        ApplyAimConstraintsToAllGuns();
+        ApplyLockSprintingToAllGuns();
+        ApplySlidingOverrideToLocalPlayer();
     }
 
     private void SetupFileWatcher()
@@ -158,275 +125,101 @@ public class SparrohPlugin : BaseUnityPlugin
         }
     }
 
-    private static void OnAimConstraintSettingChanged(object sender, EventArgs e)
+    private static void OnSettingChanged(object sender, EventArgs e)
     {
         pendingConstraintRefresh = true;
     }
 
-    public static void ModifyWeaponPrefix(Gun __instance, IGear prefab)
+    internal static void ApplySlidingOverrideToLocalPlayer()
     {
-        if (prefab is not Gun gunPrefab)
-            return;
+        try
+        {
+            Player player = Player.LocalPlayer;
+            if (player == null)
+                return;
 
-        var aimData = __instance.gameObject.GetComponent<AimStateData>();
-        if (aimData == null)
-            aimData = __instance.gameObject.AddComponent<AimStateData>();
-
-        ApplyAimConstraints(gunPrefab, aimData);
+            // Matches AimWhileSlidingUpgrade: player-level override beats per-gun defaults.
+            player.OverrideCanAimWhileSliding = enableCanAimWhileSliding.Value
+                ? FireConstraints.ActionFireMode.CanPerformDuring
+                : FireConstraints.ActionFireMode.CannotPerformDuring;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"Error applying sliding aim override: {ex.Message}");
+        }
     }
 
-    internal static void ApplyAimConstraintsToAllGuns()
+    internal static void ApplyLockSprintingToAllGuns()
     {
         try
         {
             Gun[] guns = UnityEngine.Object.FindObjectsOfType<Gun>();
             for (int i = 0; i < guns.Length; i++)
             {
-                Gun gun = guns[i];
-                if (gun == null)
-                    continue;
-
-                var aimData = gun.gameObject.GetComponent<AimStateData>();
-                if (aimData == null)
-                    aimData = gun.gameObject.AddComponent<AimStateData>();
-
-                ApplyAimConstraints(gun, aimData);
+                if (guns[i] != null)
+                    ApplyLockSprinting(guns[i]);
             }
-
-            Logger.LogInfo($"Re-applied aim constraints to {guns.Length} gun(s).");
         }
         catch (Exception ex)
         {
-            Logger.LogError($"Error re-applying aim constraints: {ex.Message}");
+            Logger.LogError($"Error re-applying lockSprinting: {ex.Message}");
         }
     }
 
-    internal static void ApplyAimConstraints(Gun gun, AimStateData aimData)
+    internal static void ApplyLockSprinting(Gun gun)
     {
-        if (gun == null)
+        if (gun == null || lockSprintingField == null)
             return;
 
         try
         {
-            object gunDataObj = gunDataField?.GetValue(gun);
-            if (gunDataObj != null)
+            int key = gun.GetInstanceID();
+            bool current = (bool)lockSprintingField.GetValue(gun);
+
+            if (!originalLockSprinting.TryGetValue(key, out bool original))
             {
-                ApplyAimConstraintsToGunDataObject(gun, gunDataObj, aimData);
+                // First time we see this instance: capture vanilla value before we mutate it.
+                original = current;
+                originalLockSprinting[key] = original;
+            }
+
+            // lockSprinting increments SprintLocks on equip and blocks sprint while the gun is held.
+            bool desired = enableCanAimWhileSprinting.Value ? false : original;
+            if (current == desired)
                 return;
-            }
 
-            ref var gunData = ref gun.GunData;
-            ApplyAimConstraintsToGunData(gun, ref gunData, aimData);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError($"Error applying aim constraints: {ex.Message}");
-        }
-    }
+            lockSprintingField.SetValue(gun, desired);
 
-    private static OriginalAimConstraints GetOrCaptureOriginals(
-        Gun gun,
-        FireConstraints.ActionFireMode canAimWhileSliding,
-        bool canAimWhileReloading,
-        bool lockSprinting)
-    {
-        int key = gun.GetInstanceID();
-        if (!originalConstraints.TryGetValue(key, out OriginalAimConstraints original))
-        {
-            original = new OriginalAimConstraints
+            // If the gun is already equipped, keep SprintLocks in sync with the field Enable/Disable use.
+            if (gun.Active)
             {
-                CanAimWhileSliding = canAimWhileSliding,
-                CanAimWhileReloading = canAimWhileReloading,
-                LockSprinting = lockSprinting
-            };
-            originalConstraints[key] = original;
-        }
-
-        return original;
-    }
-
-    private static void ApplyAimConstraintsToGunData(Gun gun, ref GunData gunData, AimStateData aimData)
-    {
-        bool currentLockSprinting = lockSprintingField != null && (bool)lockSprintingField.GetValue(gun);
-        OriginalAimConstraints original = GetOrCaptureOriginals(
-            gun,
-            gunData.fireConstraints.canAimWhileSliding,
-            gunData.fireConstraints.canAimWhileReloading,
-            currentLockSprinting);
-
-        gunData.fireConstraints.canAimWhileSliding = enableCanAimWhileSliding.Value
-            ? FireConstraints.ActionFireMode.CanPerformDuring
-            : original.CanAimWhileSliding;
-
-        gunData.fireConstraints.canAimWhileReloading = enableCanAimWhileReloading.Value
-            ? true
-            : original.CanAimWhileReloading;
-
-        if (aimData != null)
-            aimData.CanAimWhileSprinting = enableCanAimWhileSprinting.Value;
-
-        if (lockSprintingField != null)
-        {
-            bool lockSprintingValue = enableCanAimWhileSprinting.Value
-                ? false
-                : original.LockSprinting;
-            lockSprintingField.SetValue(gun, lockSprintingValue);
-        }
-    }
-
-    private static void ApplyAimConstraintsToGunDataObject(Gun gun, object gunDataObj, AimStateData aimData)
-    {
-        FieldInfo fireConstraintsField = gunDataObj.GetType().GetField("fireConstraints");
-        if (fireConstraintsField == null)
-            return;
-
-        object fireConstraints = fireConstraintsField.GetValue(gunDataObj);
-        if (fireConstraints == null)
-            return;
-
-        Type constraintsType = fireConstraints.GetType();
-        FieldInfo slideField = constraintsType.GetField("canAimWhileSliding");
-        FieldInfo reloadField = constraintsType.GetField("canAimWhileReloading");
-        if (slideField == null || reloadField == null)
-            return;
-
-        bool currentLockSprinting = lockSprintingField != null && (bool)lockSprintingField.GetValue(gun);
-        OriginalAimConstraints original = GetOrCaptureOriginals(
-            gun,
-            (FireConstraints.ActionFireMode)slideField.GetValue(fireConstraints),
-            (bool)reloadField.GetValue(fireConstraints),
-            currentLockSprinting);
-
-        object slideValue = enableCanAimWhileSliding.Value
-            ? FireConstraints.ActionFireMode.CanPerformDuring
-            : original.CanAimWhileSliding;
-        object reloadValue = enableCanAimWhileReloading.Value
-            ? true
-            : original.CanAimWhileReloading;
-
-        slideField.SetValue(fireConstraints, slideValue);
-        reloadField.SetValue(fireConstraints, reloadValue);
-        fireConstraintsField.SetValue(gunDataObj, fireConstraints);
-
-        if (gunDataField != null && gunDataField.FieldType.IsValueType)
-            gunDataField.SetValue(gun, gunDataObj);
-
-        if (aimData != null)
-            aimData.CanAimWhileSprinting = enableCanAimWhileSprinting.Value;
-
-        if (lockSprintingField != null)
-        {
-            bool lockSprintingValue = enableCanAimWhileSprinting.Value
-                ? false
-                : original.LockSprinting;
-            lockSprintingField.SetValue(gun, lockSprintingValue);
-        }
-    }
-
-    public static bool OnStartAimPrefix(Gun __instance)
-    {
-        try
-        {
-            var aimData = __instance.gameObject.GetComponent<AimStateData>();
-            if (aimData != null && aimData.CanAimWhileSprinting)
-            {
-                FieldInfo playerField = AccessTools.Field(typeof(Gun), "player");
-                if (playerField != null)
+                Player player = gun.Player;
+                if (player != null)
                 {
-                    Player player = (Player)playerField.GetValue(__instance);
-                    if (player != null)
-                    {
-                        PropertyInfo isSprintingProp = AccessTools.Property(typeof(Player), "IsSprinting");
-                        if (isSprintingProp != null)
-                        {
-                            aimData.WasSprinting = (bool)isSprintingProp.GetValue(player);
-                        }
-                    }
+                    if (current && !desired)
+                        player.SprintLocks = Math.Max(0, player.SprintLocks - 1);
+                    else if (!current && desired)
+                        player.SprintLocks++;
                 }
             }
         }
         catch (Exception ex)
         {
-            Logger.LogError($"Error in OnStartAimPrefix: {ex.Message}");
-        }
-        return true;
-    }
-
-    public static void OnStartAimPostfix(Gun __instance)
-    {
-        try
-        {
-            var aimData = __instance.gameObject.GetComponent<AimStateData>();
-            if (aimData != null && aimData.CanAimWhileSprinting && aimData.WasSprinting)
-            {
-                FieldInfo playerField = AccessTools.Field(typeof(Gun), "player");
-                if (playerField != null)
-                {
-                    Player player = (Player)playerField.GetValue(__instance);
-                    if (player != null)
-                    {
-                        MethodInfo resumeSprintMethod = AccessTools.Method(typeof(Player), "ResumeSprint");
-                        if (resumeSprintMethod != null)
-                        {
-                            resumeSprintMethod.Invoke(player, null);
-                        }
-                    }
-                }
-                aimData.WasSprinting = false;
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError($"Error in OnStartAimPostfix: {ex.Message}");
+            Logger.LogError($"Error applying lockSprinting: {ex.Message}");
         }
     }
 
-    public static bool CanAimPrefix(Gun __instance, ref bool __result)
-    {
-        try
-        {
-            var aimData = __instance.gameObject.GetComponent<AimStateData>();
-            if (aimData != null && aimData.CanAimWhileSprinting)
-            {
-                FieldInfo playerField = AccessTools.Field(typeof(Gun), "player");
-                if (playerField != null)
-                {
-                    Player player = (Player)playerField.GetValue(__instance);
-                    if (player != null)
-                    {
-                        PropertyInfo isSprintingProp = AccessTools.Property(typeof(Player), "IsSprinting");
-                        if (isSprintingProp != null && (bool)isSprintingProp.GetValue(player))
-                        {
-                            FieldInfo isAimInputHeldField = AccessTools.Field(typeof(Gun), "isAimInputHeld");
-                            if (isAimInputHeldField != null)
-                            {
-                                bool isAimInputHeld = (bool)isAimInputHeldField.GetValue(__instance);
-                                if (isAimInputHeld)
-                                {
-                                    __result = true;
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError($"Error in CanAimPrefix: {ex.Message}");
-        }
-        return true;
-    }
 
     private void OnDestroy()
     {
         if (enableCanAimWhileSliding != null)
-            enableCanAimWhileSliding.SettingChanged -= OnAimConstraintSettingChanged;
+            enableCanAimWhileSliding.SettingChanged -= OnSettingChanged;
         if (enableCanAimWhileReloading != null)
-            enableCanAimWhileReloading.SettingChanged -= OnAimConstraintSettingChanged;
+            enableCanAimWhileReloading.SettingChanged -= OnSettingChanged;
         if (enableCanAimWhileSprinting != null)
-            enableCanAimWhileSprinting.SettingChanged -= OnAimConstraintSettingChanged;
+            enableCanAimWhileSprinting.SettingChanged -= OnSettingChanged;
+        if (showReloadAnimWhileAiming != null)
+            showReloadAnimWhileAiming.SettingChanged -= OnSettingChanged;
 
         if (configWatcher != null)
         {
@@ -440,10 +233,4 @@ public class SparrohPlugin : BaseUnityPlugin
 
         harmony?.UnpatchSelf();
     }
-}
-
-public class AimStateData : MonoBehaviour
-{
-    public bool CanAimWhileSprinting { get; set; }
-    public bool WasSprinting { get; set; }
 }

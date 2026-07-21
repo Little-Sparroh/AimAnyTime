@@ -3,9 +3,9 @@ schemaVersion = "0.0.1"
 
 [package]
 namespace = "Sparroh"
-name = "ReloadAnyTime"
-description = "Allows aiming while reloading, sliding, and sprinting."
-websiteUrl = "https://github.com/Little-Sparroh/ReloadAnyTime"
+name = "AimAnyTime"
+description = "Aim while reloading, sliding, and sprinting — with visible reload animations while ADS."
+websiteUrl = "https://github.com/Little-Sparroh/AimAnyTime"
 containsNsfwContent = false
 
 [package.dependencies]
@@ -17,8 +17,8 @@ readme = "README.md"
 outdir = "build"
 
 [[build.copy]]
-source = "bin/Release/net48/ReloadAnyTime.dll"
-target = "BepInEx/plugins/ReloadAnyTime.dll"
+source = "bin/Release/net48/AimAnyTime.dll"
+target = "BepInEx/plugins/AimAnyTime.dll"
 
 [[build.copy]]
 source = "CHANGELOG.md"
